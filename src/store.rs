@@ -241,13 +241,20 @@ impl Store {
         }
         let mut use_fts = false;
         if let Some(query) = &q.query {
-            if self.has_fts {
-                // Phrase query so FTS5 metacharacters in user input can't break it.
-                let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+            if self.has_fts && !query.trim().is_empty() {
+                // Token-prefix FTS (fast) UNION substring LIKE (parity with the
+                // original `%query%` semantics: FTS phrase MATCH is whole-word
+                // and would miss e.g. "meet" in "meeting").
+                let prefix = query
+                    .split_whitespace()
+                    .map(|t| format!("{}*", t.replace('"', "\"\"")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 clauses.push(
-                    "rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)".into(),
+                    "(rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?) OR LOWER(content) LIKE LOWER(?))".into(),
                 );
-                push(&mut args, phrase);
+                push(&mut args, prefix);
+                push(&mut args, format!("%{query}%"));
                 use_fts = true;
             } else {
                 clauses.push("LOWER(content) LIKE LOWER(?)".into());
@@ -274,11 +281,11 @@ impl Store {
         let matched = match run(&sql, &refs) {
             Ok(v) => v,
             Err(_) if use_fts => {
-                // FTS failed (e.g. query too long): fall back to LIKE.
+                // FTS failed (e.g. query too long): fall back to pure LIKE.
                 let mut sql2 = format!("SELECT {} FROM messages", Self::MSG_COLS);
                 let mut c2: Vec<String> = clauses
                     .into_iter()
-                    .filter(|c| !c.starts_with("rowid IN"))
+                    .filter(|c| !c.contains("messages_fts"))
                     .collect();
                 c2.push("LOWER(content) LIKE LOWER(?)".into());
                 sql2.push_str(" WHERE ");
@@ -658,7 +665,7 @@ mod tests {
         for (jid, name, ts) in [
             ("alice@s.whatsapp.net", "Alice", 200),
             ("bob@s.whatsapp.net", "Bob", 300),
-            ("group@g.us", "Study Group", 500),
+            ("group@g.us", "Study Group", 600),
         ] {
             s.upsert_chat(jid, name, ts).unwrap();
         }
@@ -726,6 +733,15 @@ mod tests {
             false,
         ))
         .unwrap();
+        s.upsert_message(&msg(
+            "m6",
+            "group@g.us",
+            "bob@lid",
+            "weekend meetup",
+            600,
+            false,
+        ))
+        .unwrap();
         s
     }
 
@@ -739,9 +755,10 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0].id, "m5");
-        assert_eq!(v[1].id, "m4");
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].id, "m6");
+        assert_eq!(v[1].id, "m5");
+        assert_eq!(v[2].id, "m4");
     }
 
     #[test]
@@ -764,7 +781,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(v.len(), 2);
+        assert_eq!(v.len(), 3);
     }
 
     #[test]
@@ -799,6 +816,23 @@ mod tests {
         assert_eq!(p0.len(), 2);
         assert_eq!(p1.len(), 2);
         assert_ne!(p0[0].id, p1[0].id);
+    }
+
+    #[test]
+    fn query_matches_partial_words() {
+        // "meet" must hit "meeting" and "meetup": FTS phrase MATCH alone
+        // is whole-word and would miss both (original was %meet% LIKE).
+        let s = seeded();
+        let v = s
+            .list_messages(&ListMessagesQuery {
+                query: Some("meet".into()),
+                limit: 10,
+                include_context: false,
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = v.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"m4"), "meet in meeting: {ids:?}");
     }
 
     #[test]
@@ -844,7 +878,7 @@ mod tests {
         let chats = s.list_chats(None, 10, 0, true, "last_active").unwrap();
         assert_eq!(chats.len(), 3);
         assert_eq!(chats[0].jid, "group@g.us");
-        assert_eq!(chats[0].last_message.as_deref(), Some("see you there"));
+        assert_eq!(chats[0].last_message.as_deref(), Some("weekend meetup"));
         let by_name = s.list_chats(None, 10, 0, false, "name").unwrap();
         assert_eq!(by_name[0].name.as_deref(), Some("Alice"));
         let q = s
@@ -867,7 +901,7 @@ mod tests {
         // groups excluded
         assert!(s.search_contacts("group").unwrap().is_empty());
         let last = s.get_last_interaction("bob@lid").unwrap().unwrap();
-        assert_eq!(last.id, "m5");
+        assert_eq!(last.id, "m6");
         let cc = s.get_contact_chats("alice@s.whatsapp.net", 10, 0).unwrap();
         assert_eq!(cc.len(), 2);
         assert_eq!(s.get_sender_name("alice@s.whatsapp.net"), "Alice");

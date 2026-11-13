@@ -237,13 +237,12 @@ impl McpServer {
     fn get_message_context(
         &self,
         Parameters(p): Parameters<GetMessageContextParams>,
-    ) -> Json<Option<crate::types::MessageContextDto>> {
-        Json(
-            self.wa
-                .store
-                .get_message_context(&p.message_id, p.before, p.after)
-                .ok(),
-        )
+    ) -> Result<Json<crate::types::MessageContextDto>, rmcp::ErrorData> {
+        self.wa
+            .store
+            .get_message_context(&p.message_id, p.before, p.after)
+            .map(Json)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))
     }
 
     #[tool(
@@ -379,19 +378,22 @@ impl McpServer {
     async fn check_on_whatsapp(
         &self,
         Parameters(p): Parameters<CheckOnWhatsappParams>,
-    ) -> Json<Vec<serde_json::Value>> {
-        let Ok(client) = self.wa.require_client() else {
-            return Json(vec![]);
-        };
+    ) -> Result<Json<Vec<serde_json::Value>>, rmcp::ErrorData> {
+        let client = self
+            .wa
+            .require_client()
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         let jids: Vec<whatsapp_rust::Jid> = p
             .phone_numbers
             .iter()
             .filter_map(|n| Wa::parse_recipient(n).ok())
             .collect();
-        let Ok(results) = client.contacts().is_on_whatsapp(&jids).await else {
-            return Json(vec![]);
-        };
-        Json(
+        let results = client
+            .contacts()
+            .is_on_whatsapp(&jids)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(
             results
                 .iter()
                 .map(|r| {
@@ -402,7 +404,7 @@ impl McpServer {
                     })
                 })
                 .collect(),
-        )
+        ))
     }
 
     #[tool(description = "Get group metadata: subject and participant list")]
@@ -432,42 +434,50 @@ impl McpServer {
     async fn send_reaction(
         &self,
         Parameters(p): Parameters<SendReactionParams>,
-    ) -> Json<SendOutcome> {
+    ) -> Result<Json<SendOutcome>, rmcp::ErrorData> {
         let Ok(client) = self.wa.require_client() else {
-            return Json(SendOutcome {
+            return Ok(Json(SendOutcome {
                 success: false,
                 message: crate::types::NOT_PAIRED_MSG.into(),
-            });
+            }));
         };
         let Ok(chat) = Wa::parse_recipient(&p.chat_jid) else {
-            return Json(SendOutcome {
+            return Ok(Json(SendOutcome {
                 success: false,
                 message: "invalid chat JID".into(),
-            });
+            }));
         };
-        // Group/status targets must carry the original sender as participant.
-        let participant = self
+        // Groups and status@broadcast must carry the original sender as
+        // participant; from_me reflects the target's stored direction.
+        let ctx = self
             .wa
             .store
             .get_message_context(&p.message_id, 0, 0)
-            .ok()
-            .map(|c| c.message.sender)
-            .filter(|s| !s.is_empty());
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
+        let from_me = ctx.message.is_from_me;
+        let participant = if chat.server == whatsapp_rust::Server::Group
+            || chat.server == whatsapp_rust::Server::Broadcast
+        {
+            let s = ctx.message.sender.clone();
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        };
         let key = whatsapp_rust::prelude::wa::MessageKey {
             remote_jid: Some(chat.to_string()),
-            from_me: None,
+            from_me: Some(from_me),
             id: Some(p.message_id.clone()),
             participant,
         };
         match client.send_reaction(chat, key, &p.emoji).await {
-            Ok(_) => Json(SendOutcome {
+            Ok(_) => Ok(Json(SendOutcome {
                 success: true,
                 message: format!("reaction sent to {}", p.message_id),
-            }),
-            Err(e) => Json(SendOutcome {
+            })),
+            Err(e) => Ok(Json(SendOutcome {
                 success: false,
                 message: e.to_string(),
-            }),
+            })),
         }
     }
 
@@ -561,11 +571,22 @@ fn base64_encode(bytes: &[u8]) -> String {
 pub async fn serve(cfg: &AppConfig) -> anyhow::Result<()> {
     let wa = Wa::open(cfg)?;
     wa.connect(cfg).await?;
-    let server = McpServer { wa };
+    let server = McpServer {
+        wa: Arc::clone(&wa),
+    };
     tracing::info!("whatsapp-mcp serving on stdio");
     use rmcp::ServiceExt;
     let service = server.serve(rmcp::transport::io::stdio()).await?;
-    service.waiting().await?;
+    tokio::select! {
+        r = service.waiting() => { r?; }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutting down");
+            let client = wa.client.read().unwrap().clone();
+            if let Some(c) = client {
+                c.disconnect().await;
+            }
+        }
+    }
     Ok(())
 }
 

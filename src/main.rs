@@ -43,7 +43,12 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
-    Doctor,
+    Doctor {
+        /// Live connection check. Steals the session from a running serve
+        /// instance: stop the MCP client first.
+        #[arg(long, default_value_t = false)]
+        connect: bool,
+    },
     Config {
         #[arg(long)]
         write: Option<String>,
@@ -64,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Serve => mcp::serve(&cfg).await,
         Commands::Login { phone, full_sync } => onboard::login(&cfg, phone, full_sync).await,
         Commands::Logout { purge, yes } => onboard::logout(&cfg, purge, yes).await,
-        Commands::Doctor => onboard::doctor(&cfg).await,
+        Commands::Doctor { connect } => onboard::doctor(&cfg, connect).await,
         Commands::Config { write } => onboard::config(&cfg, write).await,
         Commands::ImportLegacy { from } => onboard::import_legacy(&cfg, &from).await,
     }

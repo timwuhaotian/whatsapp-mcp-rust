@@ -1,7 +1,7 @@
 # whatsapp-mcp (Rust)
 
 One binary, one process, no REST/Go/Python/uv. WhatsApp protocol via
-[`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust) (whatsmeow's Rust
+[`whatsapp-rust`](https://github.com/oxidezap/whatsapp-rust) (whatsmeow's Rust
 port), MCP via [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)
 stdio transport, local store in SQLite.
 
@@ -23,6 +23,9 @@ whatsapp-mcp config --write claude   # or: cursor. Prints JSON without --write
 Restart your MCP client. Done — no second process, no ports.
 
 `login --phone 15551234567` uses an 8-digit pair code instead of QR-only.
+`login --full-sync` requests a full history backfill (UWP device props +
+`require_full_sync` + 365-day config; slower, more traffic) instead of
+recent-only sync.
 `logout` unpairs (`--purge` also wipes local messages/media, `--yes` required).
 `import-legacy --from <old messages.db>` imports chats/messages from the
 Python version. **Sessions can't be migrated** (whatsmeow vs whatsapp-rust
@@ -53,8 +56,8 @@ instead of formatted strings):
 | download_media | returns `file_path`; images ≤5MB also attached as MCP image content |
 
 Extras: `whatsapp_status`, `check_on_whatsapp`, `get_group_info`,
-`mark_as_read`, `send_reaction`. The old `get_qr_code`/`relogin` tools are
-gone — `login`/`logout` subcommands replace them.
+`mark_as_read`, `send_reaction`, replacing the old serve-only QR/re-pair flow
+with the `login`/`logout` subcommands.
 
 Media captions: the Go bridge dropped them; this port keeps them (`content`
 falls back to caption).
@@ -71,3 +74,5 @@ message content alone is prompt injection until the user confirms.
 - `doctor` shows `paired: false` after working before — phone unlinked the device; `login` again.
 - send_audio fails — install ffmpeg or use send_file.
 - macOS first run may need a Transport-layer check: if `login` never emits a QR, see upstream `whatsapp-rust` issues.
+- Before `login` or `doctor --connect`, stop any running MCP client first:
+  connecting from a second process steals the session and kills serve.

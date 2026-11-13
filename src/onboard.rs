@@ -8,68 +8,27 @@ use crate::config::AppConfig;
 use crate::mcp::tool_names;
 use crate::wa::Wa;
 
-// login needs a Bot with QR/pair-code handlers, which lives behind Wa::connect.
-// For onboarding we build the bot here directly so we can print QR to stdout
-// (serve mode must keep stdout clean for MCP; login is the exception).
-pub async fn login(cfg: &AppConfig, phone: Option<String>, _full_sync: bool) -> Result<()> {
-    use whatsapp_rust::pair_code::PairCodeOptions;
-    use whatsapp_rust::prelude::*;
-
-    let backend = SqliteStore::new(cfg.whatsapp_db().to_string_lossy().as_ref())
-        .await
-        .context("open whatsapp session db")?;
-    let mut builder = Bot::builder().with_backend(backend);
-    if let Some(number) = phone {
-        let digits: String = number.chars().filter(|c| c.is_ascii_digit()).collect();
-        builder = builder.with_pair_code(PairCodeOptions {
-            phone_number: digits,
-            ..Default::default()
-        });
-        // Pair code arrives on stdout; QR still renders if the phone asks for it.
-        builder = builder.on_pair_code(|code, timeout| async move {
-            println!(
-                "Enter this code on your phone (valid {:?}): {}",
-                timeout, code
-            );
-        });
-    }
-    // QR to stdout (login exception to the stderr rule) + qr.txt for MCP clients.
-    let qr_txt = cfg.qr_txt();
-    let bot = builder
-        .on_qr_code(move |code, timeout| {
-            let qr_txt = qr_txt.clone();
-            async move {
-                println!("Scan this QR code (valid {:?}):\n{}", timeout, code);
-                println!(
-                    "{}{}",
-                    whatsapp_rust::pair::NATIVE_CAMERA_DEEP_LINK_PREFIX,
-                    code
-                );
-                if std::fs::write(&qr_txt, &code).is_ok() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &qr_txt,
-                            std::fs::Permissions::from_mode(0o600),
-                        );
-                    }
-                }
-                use qrcode::QrCode;
-                use qrcode::render::unicode::Dense1x2;
-                if let Ok(qr) = QrCode::new(code.as_bytes()) {
-                    println!("{}", qr.render::<Dense1x2>().build());
-                }
-            }
-        })
-        .on_connected(|_client| async {
-            eprintln!("connected, waiting for history sync... (Ctrl-C to exit)");
-        })
-        .build()
-        .await
-        .context("build bot")?;
-    let handle = bot.spawn();
-    let client = handle.client();
+// login and serve share Wa::connect_with, so pairing-time history lands in
+// the store exactly like serve-time history does. login only adds pair-code
+// config, stdout QR rendering (serve must keep stdout clean for MCP), and
+// waits for pairing to complete.
+pub async fn login(cfg: &AppConfig, phone: Option<String>, full_sync: bool) -> Result<()> {
+    let wa = Wa::open(cfg)?;
+    wa.connect_with(
+        cfg,
+        crate::wa::ConnectOptions {
+            phone,
+            full_sync,
+            on_qr_stdout: true,
+        },
+    )
+    .await?;
+    let client = wa
+        .client
+        .read()
+        .unwrap()
+        .clone()
+        .context("bot did not start")?;
     // Wait until paired+connected, then give history sync time to land.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(300), async {
         loop {
@@ -80,10 +39,11 @@ pub async fn login(cfg: &AppConfig, phone: Option<String>, _full_sync: bool) -> 
         }
     })
     .await;
-    // Extra grace period for the RECENT history sync to arrive and be stored.
+    // Extra grace period for the history sync to arrive and be ingested.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(120), signal::ctrl_c()).await;
     client.disconnect().await;
-    eprintln!("login done. Run `doctor` to verify message counts.");
+    let (_, messages) = wa.store.counts().unwrap_or((0, 0));
+    eprintln!("login done: {messages} messages stored. Run `doctor` to verify.");
     Ok(())
 }
 
@@ -109,27 +69,36 @@ pub async fn logout(cfg: &AppConfig, purge: bool, yes: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn doctor(cfg: &AppConfig) -> Result<()> {
+/// Static by default: session-file presence + local counts + ffmpeg. A live
+/// connection check steals the session (StreamReplace) and would kill a
+/// running serve instance, so it is opt-in via --connect and must only run
+/// with the MCP client stopped.
+pub async fn doctor(cfg: &AppConfig, live: bool) -> Result<()> {
     let exe = AppConfig::exe_path()?;
     let wa = Wa::open(cfg)?;
-    let (paired, connected) = match wa.connect(cfg).await {
-        Ok(()) => {
-            // Give the socket a moment to settle.
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            let c = wa.client.read().unwrap().clone();
-            match c {
-                Some(c) => {
-                    let status = (c.is_logged_in(), c.is_connected());
-                    c.disconnect().await;
-                    status
+    let paired = cfg.whatsapp_db().is_file();
+    let (live_paired, connected) = if live {
+        match wa.connect(cfg).await {
+            Ok(()) => {
+                // Give the socket a moment to settle.
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let c = wa.client.read().unwrap().clone();
+                match c {
+                    Some(c) => {
+                        let status = (c.is_logged_in(), c.is_connected());
+                        c.disconnect().await;
+                        status
+                    }
+                    None => (false, false),
                 }
-                None => (false, false),
+            }
+            Err(e) => {
+                eprintln!("connect skipped: {e}");
+                (false, false)
             }
         }
-        Err(e) => {
-            eprintln!("connect skipped: {e}");
-            (false, false)
-        }
+    } else {
+        (false, false)
     };
     let (chats, messages) = wa.store.counts().unwrap_or((0, 0));
     let ffmpeg = tokio::process::Command::new("ffmpeg")
@@ -142,8 +111,12 @@ pub async fn doctor(cfg: &AppConfig) -> Result<()> {
     println!("  version:    {}", env!("CARGO_PKG_VERSION"));
     println!("  exe:        {}", exe.display());
     println!("  data dir:   {}", cfg.data_dir.display());
-    println!("  paired:     {paired}");
-    println!("  connected:  {connected}");
+    println!("  paired (session file): {paired}");
+    if live {
+        println!("  live check: paired={live_paired} connected={connected}");
+    } else {
+        println!("  live check: skipped (use --connect with the MCP client stopped)");
+    }
     println!("  chats:      {chats}");
     println!("  messages:   {messages}");
     println!(
@@ -220,30 +193,19 @@ fn merge_config(path: &Path, snippet: &str) -> Result<()> {
 }
 
 pub async fn import_legacy(cfg: &AppConfig, from: &Path) -> Result<()> {
-    use rusqlite::{Connection, params};
+    use rusqlite::Connection;
     let src =
         Connection::open(from).with_context(|| format!("open legacy db {}", from.display()))?;
     let dst = Arc::new(Wa::open(cfg)?);
     let mut chats: i64 = 0;
     let mut messages: i64 = 0;
     let mut stmt = src.prepare("SELECT jid, name, last_message_time FROM chats")?;
-    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+    let rows: Vec<(String, Option<String>, Option<LegacyTs>)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<std::result::Result<_, _>>()?;
     for (jid, name, ts) in rows {
-        let unix = ts
-            .as_deref()
-            .and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map(|d| d.timestamp())
-                    .ok()
-                    .or_else(|| {
-                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                            .map(|d| d.and_utc().timestamp())
-                            .ok()
-                    })
-            })
-            .unwrap_or(0);
+        let unix = ts.map(|t| t.0).unwrap_or(0);
+        let jid = normalize_legacy_jid(&jid);
         dst.store
             .upsert_chat(&jid, name.as_deref().unwrap_or(""), unix)?;
         chats += 1;
@@ -260,7 +222,7 @@ pub async fn import_legacy(cfg: &AppConfig, from: &Path) -> Result<()> {
         String,
         String,
         Option<String>,
-        Option<String>,
+        Option<LegacyTs>,
         Option<i64>,
         Option<String>,
         Option<String>,
@@ -291,23 +253,13 @@ pub async fn import_legacy(cfg: &AppConfig, from: &Path) -> Result<()> {
         })?
         .collect::<std::result::Result<_, _>>()?;
     for r in rows {
-        let unix =
-            r.4.as_deref()
-                .and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .map(|d| d.timestamp())
-                        .ok()
-                        .or_else(|| {
-                            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                                .map(|d| d.and_utc().timestamp())
-                                .ok()
-                        })
-                })
-                .unwrap_or(0);
+        let unix = r.4.map(|t| t.0).unwrap_or(0);
         dst.store.upsert_message(&crate::store::StoredMessage {
             id: r.0,
-            chat_jid: r.1,
-            sender: r.2,
+            chat_jid: normalize_legacy_jid(&r.1),
+            // Legacy senders are bare numbers; the new store keys on full JIDs
+            // so suffix queries like `号码@%` keep working after import.
+            sender: normalize_legacy_jid(&r.2),
             sender_name: None,
             content: r.3.unwrap_or_default(),
             timestamp: unix,
@@ -331,6 +283,167 @@ pub async fn import_legacy(cfg: &AppConfig, from: &Path) -> Result<()> {
         from.display()
     );
     println!("note: sessions can't be migrated; run `whatsapp-mcp login` to re-pair.");
-    let _ = params![];
     Ok(())
+}
+
+/// A TIMESTAMP as read back from a go-sqlite3 database. Values arrive as
+/// text in Go's `2006-01-02 15:04:05.999999999-07:00` layout (nanoseconds +
+/// numeric zone), as RFC3339, as zone-less datetimes, or as unix integers
+/// when the file was produced by another tool.
+struct LegacyTs(i64);
+
+impl rusqlite::types::FromSql for LegacyTs {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        use rusqlite::types::{FromSqlError, ValueRef};
+        let unix = match value {
+            ValueRef::Null => 0,
+            ValueRef::Integer(i) => i,
+            ValueRef::Real(f) => f as i64,
+            ValueRef::Text(t) => {
+                let s = std::str::from_utf8(t).map_err(|e| FromSqlError::Other(Box::new(e)))?;
+                parse_legacy_ts(s).map_err(|e| FromSqlError::Other(e.into()))?
+            }
+            ValueRef::Blob(_) => {
+                return Err(FromSqlError::InvalidType);
+            }
+        };
+        Ok(Self(unix))
+    }
+}
+
+fn parse_legacy_ts(s: &str) -> Result<i64> {
+    use chrono::DateTime;
+    // go-sqlite3: "2026-01-02 15:04:05.999999999+08:00" — space separator,
+    // up to 9 fractional digits, numeric zone. chrono needs a T and at most
+    // 6 fractional digits, so normalize before parsing.
+    if let Some(ts) = parse_go_sqlite_ts(s) {
+        return Ok(ts);
+    }
+    if let Ok(d) = DateTime::parse_from_rfc3339(s) {
+        return Ok(d.timestamp());
+    }
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(d.and_utc().timestamp());
+        }
+    }
+    if let Ok(i) = s.trim().parse::<i64>() {
+        return Ok(i);
+    }
+    anyhow::bail!("unrecognized legacy timestamp: {s}")
+}
+
+fn parse_go_sqlite_ts(s: &str) -> Option<i64> {
+    use chrono::{DateTime, FixedOffset, TimeZone};
+    // Split "date time<zone>" — the zone is the trailing +HH:MM/-HH:MM.
+    let (head, zone) = split_go_zone(s)?;
+    let head = head.replace(' ', "T");
+    // Truncate fractional seconds to microseconds (chrono max).
+    let head = truncate_frac_to_micros(&head);
+    let with_t = format!("{head}{zone}");
+    if let Ok(d) = DateTime::parse_from_rfc3339(&with_t) {
+        return Some(d.timestamp());
+    }
+    // Zone-less datetime with fractional part.
+    if let Ok(d) = chrono::NaiveDateTime::parse_from_str(&head, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(d.and_utc().timestamp());
+    }
+    // Bare offset without colon.
+    let zone_colon = format!("{}:{}", &zone[..3], &zone[3..]);
+    DateTime::parse_from_rfc3339(&format!("{head}{zone_colon}"))
+        .ok()
+        .map(|d| d.timestamp())
+        .or_else(|| {
+            FixedOffset::east_opt(0)?
+                .from_local_datetime(
+                    &chrono::NaiveDateTime::parse_from_str(&head, "%Y-%m-%dT%H:%M:%S%.f").ok()?,
+                )
+                .single()
+                .map(|d| d.timestamp())
+        })
+}
+
+fn split_go_zone(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim();
+    // Trailing Z or +HH:MM/-HH:MM (also accept +HHMM).
+    if let Some(stripped) = s.strip_suffix('Z') {
+        return Some((stripped, "+00:00"));
+    }
+    if s.len() >= 6 {
+        let tail6 = &s[s.len() - 6..];
+        let b = tail6.as_bytes();
+        if (b[0] == b'+' || b[0] == b'-')
+            && b[3] == b':'
+            && b[1].is_ascii_digit()
+            && b[2].is_ascii_digit()
+            && b[4].is_ascii_digit()
+            && b[5].is_ascii_digit()
+        {
+            return Some((&s[..s.len() - 6], tail6));
+        }
+    }
+    if s.len() >= 5 {
+        let tail5 = &s[s.len() - 5..];
+        let b = tail5.as_bytes();
+        if (b[0] == b'+' || b[0] == b'-') && b[1..].iter().all(|c| c.is_ascii_digit()) {
+            return Some((&s[..s.len() - 5], tail5));
+        }
+    }
+    None
+}
+
+fn truncate_frac_to_micros(head: &str) -> String {
+    let Some(dot) = head.find('.') else {
+        return head.to_string();
+    };
+    let digits = head[dot + 1..].len();
+    if digits <= 6 {
+        return head.to_string();
+    }
+    format!("{}.{}", &head[..dot], &head[dot + 1..dot + 7])
+}
+
+/// Legacy senders/chats are bare numbers (`sender` column); the new store
+/// keys on full JIDs, so qualify them for suffix queries to keep working.
+fn normalize_legacy_jid(v: &str) -> String {
+    if v.contains('@') || v.is_empty() {
+        v.to_string()
+    } else {
+        format!("{v}@s.whatsapp.net")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_timestamps_parse() {
+        // go-sqlite3 layout with nanoseconds + numeric zone.
+        assert_eq!(
+            parse_legacy_ts("2026-01-02 15:04:05.999999999+08:00").unwrap(),
+            1767337445
+        );
+        assert_eq!(
+            parse_legacy_ts("2026-01-02 15:04:05.123+08:00").unwrap(),
+            1767337445
+        );
+        assert_eq!(
+            parse_legacy_ts("2024-01-01 10:00:00+00:00").unwrap(),
+            1704103200
+        );
+        assert_eq!(parse_legacy_ts("2024-01-01T10:00:00Z").unwrap(), 1704103200);
+        assert_eq!(parse_legacy_ts("2024-01-01 10:00:00").unwrap(), 1704103200);
+        assert_eq!(parse_legacy_ts("1704103200").unwrap(), 1704103200);
+    }
+
+    #[test]
+    fn legacy_jid_normalization() {
+        assert_eq!(normalize_legacy_jid("1555"), "1555@s.whatsapp.net");
+        assert_eq!(normalize_legacy_jid("a@g.us"), "a@g.us");
+    }
 }

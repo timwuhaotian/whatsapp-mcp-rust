@@ -27,10 +27,6 @@ impl AppConfig {
         self.data_dir.join("media")
     }
 
-    pub fn qr_txt(&self) -> PathBuf {
-        self.data_dir.join("qr.txt")
-    }
-
     pub fn ensure_dirs(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("create data dir {}", self.data_dir.display()))?;

@@ -3,7 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use whatsapp_rust::pair::NATIVE_CAMERA_DEEP_LINK_PREFIX;
+use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust::prelude::*;
+use whatsapp_rust::wacore::store::DevicePropsOverride;
 
 use crate::config::{AppConfig, chat_media_dir};
 use crate::extract::{self, Extracted};
@@ -23,6 +25,19 @@ pub struct Wa {
     pub data_dir: std::path::PathBuf,
     pub state: Arc<RwLock<ConnState>>,
     pub client: RwLock<Option<Arc<Client>>>,
+    /// Set by login so the shared PairingQrCode handler also prints the QR
+    /// and pair code to stdout (serve must keep stdout clean for MCP).
+    pub stdout_qr: std::sync::atomic::AtomicBool,
+}
+
+/// Options for establishing the WhatsApp connection. Serve and login share
+/// this pipeline so both ingest messages/history identically; login only adds
+/// pair-code config, a stdout QR hook, and waits for pairing to complete.
+#[derive(Default)]
+pub struct ConnectOptions {
+    pub phone: Option<String>,
+    pub full_sync: bool,
+    pub on_qr_stdout: bool,
 }
 
 impl Wa {
@@ -32,6 +47,7 @@ impl Wa {
             data_dir: cfg.data_dir.clone(),
             state: Arc::new(RwLock::new(ConnState::Unpaired)),
             client: RwLock::new(None),
+            stdout_qr: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -71,6 +87,14 @@ impl Wa {
     /// background. Returns when the first connection attempt settles; the
     /// caller decides whether to block on QR/pairing afterwards.
     pub async fn connect(self: &Arc<Self>, cfg: &AppConfig) -> Result<()> {
+        self.connect_with(cfg, ConnectOptions::default()).await
+    }
+
+    pub async fn connect_with(
+        self: &Arc<Self>,
+        cfg: &AppConfig,
+        opts: ConnectOptions,
+    ) -> Result<()> {
         if self.client.read().unwrap().is_some() {
             return Ok(());
         }
@@ -79,8 +103,32 @@ impl Wa {
             .context("open whatsapp session db")?;
         self.set_state(ConnState::Connecting);
         let me = Arc::clone(self);
-        let bot = Bot::builder()
-            .with_backend(backend)
+        let mut builder = Bot::builder().with_backend(backend);
+        if let Some(number) = opts.phone {
+            let digits: String = number.chars().filter(|c| c.is_ascii_digit()).collect();
+            builder = builder.with_pair_code(PairCodeOptions {
+                phone_number: digits,
+                ..Default::default()
+            });
+        }
+        if opts.full_sync {
+            // UWP row of the device-props branch table: ask the server for a
+            // full backfill instead of recent-only. Costs more time/traffic.
+            builder = builder.with_device_props(
+                DevicePropsOverride::new()
+                    .with_platform_type(wa::device_props::PlatformType::UWP)
+                    .with_require_full_sync(true)
+                    .with_history_sync_config(wa::device_props::HistorySyncConfig {
+                        full_sync_days_limit: Some(365),
+                        ..Default::default()
+                    }),
+            );
+        }
+        if opts.on_qr_stdout {
+            self.stdout_qr
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let bot = builder
             .on_event(move |event, client| {
                 let me = Arc::clone(&me);
                 async move {
@@ -103,10 +151,28 @@ impl Wa {
         match event {
             Event::PairingQrCode(qr) => {
                 self.on_qr(&qr.code);
-                Self::render_qr_stderr(&qr.code);
+                if self.stdout_qr.load(std::sync::atomic::Ordering::Relaxed) {
+                    // login is the only stdout exception: the user scans here.
+                    println!("Scan this QR code (valid {:?}):", qr.timeout);
+                    println!("{}{}", NATIVE_CAMERA_DEEP_LINK_PREFIX, qr.code);
+                    use qrcode::QrCode;
+                    use qrcode::render::unicode::Dense1x2;
+                    if let Ok(qr_img) = QrCode::new(qr.code.as_bytes()) {
+                        println!("{}", qr_img.render::<Dense1x2>().build());
+                    }
+                } else {
+                    Self::render_qr_stderr(&qr.code);
+                }
             }
             Event::PairingCode(pc) => {
-                tracing::info!("pair code (valid {:?}): {}", pc.timeout, pc.code);
+                if self.stdout_qr.load(std::sync::atomic::Ordering::Relaxed) {
+                    println!(
+                        "Enter this code on your phone (valid {:?}): {}",
+                        pc.timeout, pc.code
+                    );
+                } else {
+                    tracing::info!("pair code (valid {:?}): {}", pc.timeout, pc.code);
+                }
             }
             Event::Connected(_) => {
                 self.set_state(ConnState::Connected);
@@ -275,9 +341,36 @@ impl Wa {
             } else {
                 chat_jid_str.clone()
             };
-            let name =
-                group_or_contact_name(client, &self.store, &chat_jid, &chat_jid_str, &sender, "")
-                    .await;
+            // Chat name: authoritative stored name first, then the sync payload,
+            // network lookup last. A "Group <user>" placeholder is never stored
+            // (the short-circuit would otherwise pin it forever).
+            let sync_name = conversation_display_name(conv);
+            let existing = self
+                .store
+                .get_chat(&chat_jid_str, false)
+                .ok()
+                .flatten()
+                .and_then(|c| c.name)
+                .filter(|n| !n.is_empty() && !is_placeholder_name(n));
+            let net: Option<String> = if existing.is_some() || sync_name.is_some() {
+                None
+            } else {
+                Some(
+                    group_or_contact_name(
+                        client,
+                        &self.store,
+                        &chat_jid,
+                        &chat_jid_str,
+                        &sender,
+                        wmi.push_name.as_deref().unwrap_or(""),
+                    )
+                    .await,
+                )
+            };
+            let name = existing
+                .or(sync_name)
+                .or(net.filter(|n| !is_placeholder_name(n)))
+                .unwrap_or_default();
             let _ = self.store.upsert_chat(&chat_jid_str, &name, ts);
             let _ = self.store.upsert_message(&StoredMessage {
                 id,
@@ -322,7 +415,9 @@ impl Wa {
         let ts = now_unix();
         let chat = to.to_string();
         let me = self.own_sender();
-        let _ = self.store.upsert_chat(&chat, &chat, ts);
+        // Empty name: the CASE merge in upsert_chat keeps the stored name.
+        // (Passing the JID here used to clobber real contact names.)
+        let _ = self.store.upsert_chat(&chat, "", ts);
         let _ = self.store.upsert_message(&StoredMessage {
             id: res.message_id.clone(),
             chat_jid: chat,
@@ -361,7 +456,7 @@ impl Wa {
             .upload(data, media_type, Default::default())
             .await
             .context("upload media")?;
-        // Save入库 fields before `up` is moved into the message builder
+        // Upload first so fields survive moving `up` into the builder
         // (UploadResponse is #[non_exhaustive]: not constructible here).
         let db_url = up.url.clone();
         let db_direct = up.direct_path.clone();
@@ -375,7 +470,8 @@ impl Wa {
         let ts = now_unix();
         let chat = to.to_string();
         let me = self.own_sender();
-        let _ = self.store.upsert_chat(&chat, &chat, ts);
+        // Empty name: the CASE merge in upsert_chat keeps the stored name.
+        let _ = self.store.upsert_chat(&chat, "", ts);
         let _ = self.store.upsert_message(&StoredMessage {
             id: res.message_id.clone(),
             chat_jid: chat,
@@ -424,6 +520,12 @@ impl Wa {
             )
             .await
             .context("upload audio")?;
+        let db_url = up.url.clone();
+        let db_direct = up.direct_path.clone();
+        let db_key = up.media_key.to_vec();
+        let db_sha = up.file_sha256.to_vec();
+        let db_enc = up.file_enc_sha256.to_vec();
+        let db_len = up.file_length;
         let msg = whatsapp_rust::media::audio_message(
             up,
             whatsapp_rust::media::AudioOptions {
@@ -435,7 +537,35 @@ impl Wa {
             },
         );
         let to = Self::parse_recipient(recipient)?;
-        client.send_message(to, msg).await?;
+        let res = client.send_message(to.clone(), msg).await?;
+        let ts = now_unix();
+        let chat = to.to_string();
+        let me = self.own_sender();
+        // Empty name: the CASE merge in upsert_chat keeps the stored name.
+        let _ = self.store.upsert_chat(&chat, "", ts);
+        let _ = self.store.upsert_message(&StoredMessage {
+            id: res.message_id.clone(),
+            chat_jid: chat,
+            sender: me,
+            sender_name: None,
+            content: String::new(),
+            timestamp: ts,
+            is_from_me: true,
+            media_type: Some("audio".into()),
+            filename: Some(
+                media_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "audio.ogg".into()),
+            ),
+            url: Some(db_url),
+            direct_path: Some(db_direct),
+            media_key: Some(db_key),
+            file_sha256: Some(db_sha),
+            file_enc_sha256: Some(db_enc),
+            file_length: Some(db_len as i64),
+            mimetype: Some("audio/ogg; codecs=opus".into()),
+        });
         Ok(format!("Message sent to {recipient}"))
     }
 
@@ -509,7 +639,8 @@ fn now_unix() -> i64 {
 }
 
 /// Mirrors Go GetChatName: keep the stored name, else fetch group metadata /
-/// contact name, with push_name and JID fallbacks.
+/// contact name, with push_name and JID fallbacks. A "Group <user>" fallback
+/// is only returned, never stored: callers filter it before persisting.
 async fn group_or_contact_name(
     client: &Arc<Client>,
     store: &Store,
@@ -537,6 +668,18 @@ async fn group_or_contact_name(
         return sender_jid.to_string();
     }
     chat_jid.to_string()
+}
+
+/// Display name carried by a history-sync Conversation payload.
+fn conversation_display_name(conv: &wa::Conversation) -> Option<String> {
+    conv.name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .or_else(|| conv.display_name.clone().filter(|n| !n.is_empty()))
+}
+
+fn is_placeholder_name(name: &str) -> bool {
+    name.starts_with("Group ")
 }
 
 fn classify_media(path: &std::path::Path) -> (whatsapp_rust::download::MediaType, &'static str) {
