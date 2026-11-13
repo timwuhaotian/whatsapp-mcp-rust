@@ -22,6 +22,27 @@ whatsapp-mcp config --write claude   # or: cursor. Prints JSON without --write
 
 Restart your MCP client. Done — no second process, no ports.
 
+## Verify a live pairing
+
+After `login` (phone scanned), run the automated live check:
+
+```sh
+python3 scripts/live-smoke.py --data-dir <your-data-dir> --bin <path-to-binary>
+# or: bash scripts/live-smoke.sh  (same checks, needs python3 + the binary)
+```
+
+All PASS looks like:
+
+```
+[PASS] whatsapp_status connected — own_jid=1555...@s.whatsapp.net
+[PASS] list_chats non-empty (history sync landed) — N chats
+[PASS] search_contacts returns results — M contacts
+[PASS] send_message to self — round-trip readable
+[PASS] send_file + download_media round-trip — 1234 bytes at .../media/...
+[PASS] send_audio_message to self — ...   # SKIP when ffmpeg is missing
+--- 6/6 non-failed ---
+```
+
 `login --phone 15551234567` uses an 8-digit pair code instead of QR-only.
 `login --full-sync` requests a full history backfill (UWP device props +
 `require_full_sync` + 365-day config; slower, more traffic) instead of

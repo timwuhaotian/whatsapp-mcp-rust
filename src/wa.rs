@@ -254,6 +254,13 @@ impl Wa {
             &info.push_name,
         )
         .await;
+        // Never persist a "Group <user>" placeholder (metadata fetch failed):
+        // the CASE merge on "" keeps the stored authoritative name instead.
+        let name = if is_placeholder_name(&name) {
+            "".into()
+        } else {
+            name
+        };
         let _ = self.store.upsert_chat(&chat_jid, &name, ts);
         let _ = self.store.upsert_message(&StoredMessage {
             id: info.id.to_string(),
@@ -652,6 +659,7 @@ async fn group_or_contact_name(
     if let Ok(Some(c)) = store.get_chat(chat_jid, false)
         && let Some(n) = c.name
         && !n.is_empty()
+        && !is_placeholder_name(&n)
     {
         return n;
     }
@@ -671,11 +679,12 @@ async fn group_or_contact_name(
 }
 
 /// Display name carried by a history-sync Conversation payload.
+/// display_name first, mirroring the Go bridge (DisplayName before Name).
 fn conversation_display_name(conv: &wa::Conversation) -> Option<String> {
-    conv.name
+    conv.display_name
         .clone()
         .filter(|n| !n.is_empty())
-        .or_else(|| conv.display_name.clone().filter(|n| !n.is_empty()))
+        .or_else(|| conv.name.clone().filter(|n| !n.is_empty()))
 }
 
 fn is_placeholder_name(name: &str) -> bool {
@@ -745,5 +754,37 @@ fn build_media_message(
                 ..Default::default()
             },
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_names_filtered() {
+        assert!(is_placeholder_name("Group 12345"));
+        assert!(!is_placeholder_name("Study Group"));
+        assert!(!is_placeholder_name(""));
+    }
+
+    #[test]
+    fn conversation_display_name_prefers_display_name() {
+        let conv = wa::Conversation {
+            name: Some("Name".into()),
+            display_name: Some("Display".into()),
+            ..Default::default()
+        };
+        assert_eq!(conversation_display_name(&conv).as_deref(), Some("Display"));
+        let conv = wa::Conversation {
+            display_name: None,
+            ..conv.clone()
+        };
+        assert_eq!(conversation_display_name(&conv).as_deref(), Some("Name"));
+        let conv = wa::Conversation {
+            name: Some(String::new()),
+            ..conv.clone()
+        };
+        assert_eq!(conversation_display_name(&conv), None);
     }
 }
