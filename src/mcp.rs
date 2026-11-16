@@ -6,7 +6,6 @@ use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::config::AppConfig;
 use crate::store::ListMessagesQuery;
 use crate::types::{Contact, DownloadOutcome, SendOutcome};
 use crate::wa::Wa;
@@ -133,6 +132,12 @@ pub struct McpServer {
     wa: Arc<Wa>,
 }
 
+impl McpServer {
+    pub fn new(wa: Arc<Wa>) -> Self {
+        Self { wa }
+    }
+}
+
 #[tool_router(server_handler)]
 impl McpServer {
     #[tool(description = "Search WhatsApp contacts by name or phone number")]
@@ -155,7 +160,7 @@ impl McpServer {
                 after: p.after.as_deref().and_then(parse_iso),
                 before: p.before.as_deref().and_then(parse_iso),
                 sender: p.sender_phone_number,
-                chat_jid: p.chat_jid,
+                chat_jid: p.chat_jid.as_deref().map(Wa::normalize_chat_jid),
                 query: p.query,
                 limit: p.limit,
                 page: p.page,
@@ -194,7 +199,7 @@ impl McpServer {
         Json(
             self.wa
                 .store
-                .get_chat(&p.chat_jid, p.include_last_message)
+                .get_chat(&Wa::normalize_chat_jid(&p.chat_jid), p.include_last_message)
                 .unwrap_or(None),
         )
     }
@@ -328,7 +333,11 @@ impl McpServer {
         &self,
         Parameters(p): Parameters<DownloadMediaParams>,
     ) -> CallToolResult {
-        match self.wa.download_media(&p.message_id, &p.chat_jid).await {
+        match self
+            .wa
+            .download_media(&p.message_id, &Wa::normalize_chat_jid(&p.chat_jid))
+            .await
+        {
             Ok(path) => {
                 let outcome = DownloadOutcome {
                     success: true,
@@ -566,28 +575,6 @@ fn mime_guess(path: &std::path::Path) -> Option<&'static str> {
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-pub async fn serve(cfg: &AppConfig) -> anyhow::Result<()> {
-    let wa = Wa::open(cfg)?;
-    wa.connect(cfg).await?;
-    let server = McpServer {
-        wa: Arc::clone(&wa),
-    };
-    tracing::info!("whatsapp-mcp serving on stdio");
-    use rmcp::ServiceExt;
-    let service = server.serve(rmcp::transport::io::stdio()).await?;
-    tokio::select! {
-        r = service.waiting() => { r?; }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down");
-            let client = wa.client.read().unwrap().clone();
-            if let Some(c) = client {
-                c.disconnect().await;
-            }
-        }
-    }
-    Ok(())
 }
 
 // Re-export for onboarding reuse.

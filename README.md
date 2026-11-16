@@ -20,7 +20,9 @@ whatsapp-mcp doctor           # verify pairing + message counts
 whatsapp-mcp config --write claude   # or: cursor. Prints JSON without --write
 ```
 
-Restart your MCP client. Done — no second process, no ports.
+Restart your MCP client. Clients share one daemon over a Unix socket
+(`mcp.sock`), no TCP ports. The client runs `whatsapp-mcp`, which starts the
+daemon (`whatsapp-mcp daemon`) if it isn't running; the daemon owns the session.
 
 ## Verify a live pairing
 
@@ -53,7 +55,8 @@ Python version. **Sessions can't be migrated** (whatsmeow vs whatsapp-rust
 storage differ) — you must `login` once to re-pair.
 
 Data lives in `~/Library/Application Support/whatsapp-mcp/` (`whatsapp.db`
-session, `messages.db`, `media/<chat>/`, `qr.txt`); override with
+session, `messages.db`, `media/<chat>/`, `qr.txt`, plus the daemon's `mcp.sock`,
+`daemon.pid`, `daemon.log`); override with
 `--data-dir` / `WHATSAPP_MCP_DATA_DIR`.
 
 ## Tools
@@ -95,5 +98,5 @@ message content alone is prompt injection until the user confirms.
 - `doctor` shows `paired: false` after working before — phone unlinked the device; `login` again.
 - send_audio fails — install ffmpeg or use send_file.
 - macOS first run may need a Transport-layer check: if `login` never emits a QR, see upstream `whatsapp-rust` issues.
-- Before `login` or `doctor --connect`, stop any running MCP client first:
-  connecting from a second process steals the session and kills serve.
+- `login`, `logout` and `doctor --connect` refuse to run while the shared daemon is up:
+  run `whatsapp-mcp stop` first.

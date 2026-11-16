@@ -79,7 +79,7 @@ impl Wa {
             .unwrap()
             .as_ref()
             .and_then(|c| c.pn())
-            .map(|j| j.to_string())
+            .map(|j| Jid::pn(j.user).to_string())
             .unwrap_or_default()
     }
 
@@ -111,19 +111,23 @@ impl Wa {
                 ..Default::default()
             });
         }
+        // Shown in Linked Devices as "<browser> (Mac OS)". Applies only to the
+        // initial pairing; an existing session keeps the props it was paired with.
+        let mut props = DevicePropsOverride::new().with_os("Mac OS");
         if opts.full_sync {
             // UWP row of the device-props branch table: ask the server for a
             // full backfill instead of recent-only. Costs more time/traffic.
-            builder = builder.with_device_props(
-                DevicePropsOverride::new()
-                    .with_platform_type(wa::device_props::PlatformType::UWP)
-                    .with_require_full_sync(true)
-                    .with_history_sync_config(wa::device_props::HistorySyncConfig {
-                        full_sync_days_limit: Some(365),
-                        ..Default::default()
-                    }),
-            );
+            props = props
+                .with_platform_type(wa::device_props::PlatformType::UWP)
+                .with_require_full_sync(true)
+                .with_history_sync_config(wa::device_props::HistorySyncConfig {
+                    full_sync_days_limit: Some(365),
+                    ..Default::default()
+                });
+        } else {
+            props = props.with_platform_type(wa::device_props::PlatformType::CHROME);
         }
+        builder = builder.with_device_props(props);
         if opts.on_qr_stdout {
             self.stdout_qr
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -402,16 +406,33 @@ impl Wa {
 
     // ---- sending ----
 
+    /// Stored chats are keyed without the device part (`user@server`), so a
+    /// device-suffixed JID such as `6583330370:28@s.whatsapp.net` is normalized.
+    pub fn normalize_chat_jid(chat_jid: &str) -> String {
+        match chat_jid.split_once('@') {
+            Some((user, server)) => format!("{}@{server}", user.split(':').next().unwrap_or(user)),
+            None => chat_jid.to_string(),
+        }
+    }
+
     pub fn parse_recipient(recipient: &str) -> Result<Jid> {
         if recipient.contains('@') {
-            recipient.parse::<Jid>().context("parse recipient JID")
-        } else {
-            let digits: String = recipient.chars().filter(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                anyhow::bail!("Recipient must be provided");
-            }
-            Ok(Jid::pn(digits))
+            return recipient.parse::<Jid>().context("parse recipient JID");
         }
+        // Bare phone numbers only (`15551234567`, `+1 555-123-4567`). Anything
+        // else, e.g. a device-suffixed `6583330370:28`, must not be digit-stripped
+        // into a different number.
+        if !recipient
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')'))
+        {
+            anyhow::bail!("recipient must be a phone number or a full JID, got {recipient:?}");
+        }
+        let digits: String = recipient.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            anyhow::bail!("Recipient must be provided");
+        }
+        Ok(Jid::pn(digits))
     }
 
     pub async fn send_text(&self, recipient: &str, message: &str) -> Result<String> {
@@ -760,6 +781,27 @@ fn build_media_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_chat_jid_strips_device() {
+        assert_eq!(
+            Wa::normalize_chat_jid("6583330370:28@s.whatsapp.net"),
+            "6583330370@s.whatsapp.net"
+        );
+        assert_eq!(Wa::normalize_chat_jid("120363@g.us"), "120363@g.us");
+    }
+
+    #[test]
+    fn parse_recipient_rejects_device_suffix() {
+        assert!(Wa::parse_recipient("6583330370:28").is_err());
+        assert!(Wa::parse_recipient("abc").is_err());
+        assert!(Wa::parse_recipient("6583330370:28@s.whatsapp.net").is_ok());
+        assert_eq!(
+            Wa::parse_recipient("+65 8333-0370").unwrap().user,
+            "6583330370"
+        );
+        assert!(Wa::parse_recipient("").is_err());
+    }
 
     #[test]
     fn placeholder_names_filtered() {

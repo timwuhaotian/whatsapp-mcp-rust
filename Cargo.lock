@@ -2459,6 +2459,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "libc",
  "qrcode",
  "rmcp",
  "rusqlite",

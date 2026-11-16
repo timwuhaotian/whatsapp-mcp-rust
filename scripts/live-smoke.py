@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
@@ -42,7 +43,15 @@ def call(proc, msg_id: int, tool: str, args: dict):
     content = res["result"]["content"]
     texts = [c["text"] for c in content if c.get("type") == "text"]
     structured = res["result"].get("structuredContent")
-    return (structured if structured is not None else texts), None
+    if structured is not None:
+        return structured, None
+    # download_media returns its JSON as text (it also attaches an image block).
+    if texts:
+        try:
+            return json.loads(texts[0]), None
+        except ValueError:
+            pass
+    return texts, None
 
 
 def main() -> int:
@@ -72,10 +81,14 @@ def main() -> int:
     proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
     proc.stdin.flush()
 
-    # 1. status: connected + own_jid
-    msg_id += 1
-    status, err = call(proc, msg_id, "whatsapp_status", {})
-    own_jid = (status or {}).get("own_jid", "") if isinstance(status, dict) else ""
+    # 1. status: connected + own_jid. serve connects asynchronously, so poll.
+    for _ in range(30):
+        msg_id += 1
+        status, err = call(proc, msg_id, "whatsapp_status", {})
+        own_jid = (status or {}).get("own_jid", "") if isinstance(status, dict) else ""
+        if err or (isinstance(status, dict) and status.get("connected") and own_jid):
+            break
+        time.sleep(1)
     if err or not status:
         check("whatsapp_status connected", FAIL, f"tool error: {err}")
         proc.kill()
@@ -87,7 +100,7 @@ def main() -> int:
               f"connected={status.get('connected')} own_jid={own_jid!r} — is the phone paired? run login first")
         proc.kill()
         return report()
-    own_number = own_jid.split("@")[0]
+    own_number = own_jid.split("@")[0].split(":")[0]
 
     # 2. history landed
     msg_id += 1
